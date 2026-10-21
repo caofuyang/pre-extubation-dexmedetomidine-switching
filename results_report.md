@@ -1,33 +1,34 @@
-# v13 primary results
+# v13 primary results (common 48-hour risk scale)
 
-Extubation events: 15,970; analysable contrast: 4,630 (943 transition, 3,687 continued propofol)
+Extubations analysed: 4,630 (943 transition, 3,687 continued propofol)
 
-48 h reintubation, weighted cumulative incidence: 7.5% vs 3.8%
+Primary (overlap weighted): 7.5% vs 3.8%; RD +3.66 pp (+1.55 to +5.70); RR 1.97 (1.37 to 2.68)
 
-Risk difference +3.69 pp (95% CI +1.78 to +5.73)
+E-value 3.34 (CI bound 2.09); propensity-score AUC 0.787
 
-Risk ratio 1.96 (95% CI 1.43 to 2.60)
 
-Effective sample size 867 treated / 2059 control; propensity-score AUC 0.787
+## Estimators on the common scale
 
-E-value for the risk ratio 3.33; for the CI bound 2.20
-
-Bootstrap replicates: 300
-
+ risk_treated  risk_control       rd       rr        estimator    rd_low  rd_high   rr_low  rr_high  reps
+     0.062566      0.055872 0.006694 1.119815            Crude -0.012325 0.025437 0.793591 1.504947 300.0
+     0.074578      0.037934 0.036644 1.966008 Overlap weighted  0.015514 0.057001 1.372741 2.676201 300.0
+     0.090704      0.051755 0.038950 1.752578    g-computation  0.013728 0.062404 1.239095 2.304955 300.0
+     0.062566      0.032142 0.030424 1.946541        IPW (ATT)  0.012233 0.046974 1.344157 2.659838 300.0
 
 ## Strata
 
- risk_treated  risk_control        rd       rr  ess_treated  ess_control  n_treated  n_control  events_treated  events_control    rd_low  rd_high   rr_low  rr_high  reps          stratum      auc
-     0.043330      0.018483  0.024847 2.344334   590.534442   706.463289        631        816              24              20  0.005834 0.041764 1.252472 4.402783   200          cardiac 0.685057
-     0.125484      0.060361  0.065123 2.078887   270.114656  2164.690252        271       2692              33             172  0.019862 0.102997 1.310807 2.887635   200 medical_surgical 0.661454
-     0.047234      0.066340 -0.019106 0.712003    40.493785   149.820135         41        179               2              14 -0.085819 0.063230 0.000000 2.373893   200            neuro 0.725712
+ risk_treated  risk_control        rd       rr    rd_low  rd_high   rr_low  rr_high  reps          stratum  n_treated  events_treated  n_control  events_control
+     0.043286      0.018395  0.024891 2.353113  0.005561 0.043310 1.254955 5.029874   200          cardiac        631              24        816              20
+     0.122270      0.058833  0.063437 2.078257  0.018901 0.098291 1.274658 2.819057   200 medical_surgical        271              33       2692             172
+     0.047234      0.065224 -0.017990 0.724184 -0.088077 0.063166 0.000000 2.120460   200            neuro         41               2        179              14
 
 ## Sensitivity
 
- risk_treated  risk_control       rd       rr  ess_treated  ess_control  n_treated  n_control  events_treated  events_control                          variant
-     0.075412      0.038489 0.036923 1.959318   866.524480  2058.513808        943       3687              59             206                          primary
-     0.075937      0.040650 0.035287 1.868082   858.848315  1975.219765        936       3465              59             206    excluding_terminal_extubation
-     0.071373      0.037075 0.034298 1.925112   866.524480  2058.513808        943       3687              55             190 outcome_airway_reintubation_only
+ risk_treated  risk_control       rd       rr                             variant
+     0.074578      0.037934 0.036644 1.966008                    primary_48h_risk
+     0.075090      0.040077 0.035013 1.873629       excluding_terminal_extubation
+     0.064332      0.029375 0.034956 2.189992    outcome_airway_reintubation_only
+     0.075412      0.038489 0.036923 1.959318 competing_risk_cumulative_incidence
 
 ## Balance
 
