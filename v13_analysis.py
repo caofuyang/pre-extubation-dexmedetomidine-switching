@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""v13 analysis: pre-extubation propofol-to-dexmedetomidine transition and
-extubation failure, anchored on the extubation event (MIMIC-IV 3.1).
+"""v13 analysis (version 2): pre-extubation propofol-to-dexmedetomidine transition
+and extubation failure, anchored on the extubation event (MIMIC-IV 3.1).
 
-Design
-------
-Target trial emulation with the time zero moved from "readiness for extubation"
-to the ACTUAL extubation. Exposure is the sedative actually running in the 6 h
-before extubation. The primary contrast is initiating dexmedetomidine during
-that window (with propofol running at the start of the window) versus
-continuing propofol and never starting dexmedetomidine.
+Change from version 1: all estimators are now reported on the SAME scale, the
+48-hour risk of reintubation or restart of invasive ventilation. Version 1 mixed
+weighted cumulative incidence (death as competing event) with crude proportions,
+which is not a like-for-like comparison. The competing-risk cumulative incidence
+is retained as a sensitivity analysis.
 
-Because every included patient was extubated, exposure and outcome can no
-longer be the same clinical act. The cost is that the estimand is conditional
-on being extubated; see the interpretation notes in the output report.
-
-Outcome is reintubation or restart of invasive ventilation within 48 h, with
-death treated as a competing event (weighted Aalen-Johansen cumulative
-incidence at 48 h).
+Estimators reported on the common scale:
+  * crude
+  * overlap-weighted (primary)
+  * g-computation (outcome model, standardized to the cohort)
+  * inverse-probability-of-treatment weighting, targeting the treated
 
 Run:
     set MIMIC_IV_ROOT=E:\\MIMIC-IV\\data\\mimic-iv-3.1
@@ -31,10 +27,6 @@ import sys
 from pathlib import Path
 
 import duckdb
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -74,7 +66,7 @@ INPUT_ITEMS = tuple(sorted({PROP, *DEX, *VASO, *OPIOID, *MIDAZOLAM, *KETAMINE}))
 PROC_ITEMS = tuple(sorted({EXTUBATION, *UNPLANNED, REINTUBATION, VENT, *TRACH}))
 
 
-def sql_list(values):
+def sql_list(values) -> str:
     return ",".join(str(int(v)) for v in values)
 
 
@@ -82,31 +74,7 @@ def qpath(path: Path) -> str:
     return str(path).replace("'", "''")
 
 
-def main() -> None:
-    root_env = os.environ.get("MIMIC_IV_ROOT")
-    if not root_env:
-        sys.exit("Set MIMIC_IV_ROOT to the extracted MIMIC-IV 3.1 directory.")
-    MIMIC = Path(root_env).expanduser().resolve()
-    if not MIMIC.is_dir():
-        sys.exit(f"MIMIC_IV_ROOT is not a directory: {MIMIC}")
-
-    con = duckdb.connect()
-    con.execute("PRAGMA threads=4")
-    cache = _build_caches(con, MIMIC)
-    df = _build_cohort(con, cache)
-
-    analytic = df[df.grp.isin(["transition", "propofol_only"])].copy()
-    analytic["treatment"] = (analytic.grp == "transition").astype(int)
-
-    covariates = _parts()
-    res = _fit_and_report(analytic, covariates)
-
-    _write_tables(df, analytic, res)
-    _write_report(df, analytic, res)
-    print("Done. Outputs in", OUT)
-
-
-def _build_caches(con, MIMIC: Path) -> dict[str, Path]:
+def build_caches(con, MIMIC: Path) -> dict[str, Path]:
     files = {
         "input": CACHE / "mimic_input.parquet",
         "proc": CACHE / "mimic_procedure.parquet",
@@ -115,8 +83,7 @@ def _build_caches(con, MIMIC: Path) -> dict[str, Path]:
         "lab": CACHE / "mimic_lab.parquet",
         "stat": CACHE / "mimic_static.parquet",
     }
-    if files["input"].exists() and files["proc"].exists() and files["chart"].exists() \
-            and files["cam"].exists() and files["lab"].exists() and files["stat"].exists():
+    if all(p.exists() for p in files.values()):
         return files
 
     def build(target: Path, query: str) -> None:
@@ -129,8 +96,8 @@ def _build_caches(con, MIMIC: Path) -> dict[str, Path]:
         select cast(subject_id as bigint) subject_id, cast(hadm_id as bigint) hadm_id,
                cast(stay_id as bigint) stay_id, cast(starttime as timestamp) starttime,
                cast(endtime as timestamp) endtime, cast(itemid as bigint) itemid,
-               try_cast(rate as double) rate, rateuom,
-               coalesce(statusdescription,'') statusdescription
+               try_cast(rate as double) rate, rateuom, coalesce(statusdescription,'') statusdescription,
+               try_cast(patientweight as double) patientweight
         from read_csv_auto('{qpath(MIMIC / 'icu/inputevents.csv.gz')}', all_varchar=true, strict_mode=false)
         where cast(itemid as bigint) in ({sql_list(INPUT_ITEMS)})
     """)
@@ -162,8 +129,7 @@ def _build_caches(con, MIMIC: Path) -> dict[str, Path]:
     build(files["stat"], f"""
         select cast(i.subject_id as bigint) subject_id, cast(i.hadm_id as bigint) hadm_id,
                cast(i.stay_id as bigint) stay_id, cast(i.intime as timestamp) intime,
-               cast(i.outtime as timestamp) outtime, i.first_careunit,
-               p.gender,
+               cast(i.outtime as timestamp) outtime, i.first_careunit, p.gender,
                cast(p.anchor_age as double) + greatest(0, year(cast(a.admittime as timestamp)) - cast(p.anchor_year as integer)) age,
                a.admission_type, try_cast(a.deathtime as timestamp) deathtime,
                try_cast(a.dischtime as timestamp) dischtime
@@ -176,13 +142,10 @@ def _build_caches(con, MIMIC: Path) -> dict[str, Path]:
     return files
 
 
-def _build_cohort(con, files: dict[str, Path]) -> pd.DataFrame:
-    con.execute(f"create or replace view inp as select * from '{qpath(files['input'])}'")
-    con.execute(f"create or replace view proc as select * from '{qpath(files['proc'])}'")
-    con.execute(f"create or replace view chart as select * from '{qpath(files['chart'])}'")
-    con.execute(f"create or replace view cam as select * from '{qpath(files['cam'])}'")
-    con.execute(f"create or replace view lab as select * from '{qpath(files['lab'])}'")
-    con.execute(f"create or replace view stat as select * from '{qpath(files['stat'])}'")
+def build_cohort(con, files: dict[str, Path]) -> pd.DataFrame:
+    for name, key in [("inp", "input"), ("proc", "proc"), ("chart", "chart"),
+                      ("cam", "cam"), ("lab", "lab"), ("stat", "stat")]:
+        con.execute(f"create or replace view {name} as select * from '{qpath(files[key])}'")
 
     con.execute(f"""
     create or replace table trials as
@@ -190,8 +153,7 @@ def _build_cohort(con, files: dict[str, Path]) -> pd.DataFrame:
       select e.subject_id, e.hadm_id, e.stay_id, e.starttime t0,
              s.intime, s.outtime, s.first_careunit, s.gender, s.age,
              s.admission_type, s.deathtime, s.dischtime
-      from proc e join stat s using (stay_id)
-      where e.itemid = {EXTUBATION}
+      from proc e join stat s using (stay_id) where e.itemid = {EXTUBATION}
     ),
     elig as (
       select *, row_number() over (order by subject_id, t0) trial_id
@@ -335,29 +297,50 @@ def _build_cohort(con, files: dict[str, Path]) -> pd.DataFrame:
     return df
 
 
-def _parts():
-    numeric = ["age", "vent_hours", "rass_min", "fio2_max", "peep_max",
-               "lactate", "creatinine", "log_propofol_rate"]
-    categorical = ["gender", "unit_class", "admission_type"]
-    binary = ["vaso_any", "opioid_any", "sbt_any", "delirium_24h"]
-    return {"numeric": numeric, "categorical": categorical, "binary": binary}
+PARTS = {
+    "numeric": ["age", "vent_hours", "rass_min", "fio2_max", "peep_max",
+                "lactate", "creatinine", "log_propofol_rate"],
+    "categorical": ["gender", "unit_class", "admission_type"],
+    "binary": ["vaso_any", "opioid_any", "sbt_any", "delirium_24h"],
+}
 
 
-def _design(df, parts):
+def design(df: pd.DataFrame):
     work = df.copy()
-    for c in parts["binary"]:
+    for c in PARTS["binary"]:
         work[c] = work[c].fillna(0).astype(int)
-    cols = parts["numeric"] + parts["categorical"] + parts["binary"]
+    cols = PARTS["numeric"] + PARTS["categorical"] + PARTS["binary"]
     pre = ColumnTransformer([
-        ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
-                          ("sc", StandardScaler())]), parts["numeric"]),
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]),
+         PARTS["numeric"]),
         ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
-                          ("oh", OneHotEncoder(handle_unknown="ignore"))]), parts["categorical"]),
+                          ("oh", OneHotEncoder(handle_unknown="ignore"))]), PARTS["categorical"]),
     ])
     return work, cols, pre
 
 
-def _cif(group: pd.DataFrame) -> float:
+def fit_ps(df: pd.DataFrame):
+    work, cols, pre = design(df)
+    model = Pipeline([("pre", pre), ("lr", LogisticRegression(max_iter=4000, C=0.1))])
+    model.fit(work[cols], work.treatment)
+    work["ps"] = model.predict_proba(work[cols])[:, 1]
+    weight_treated = 1 - work["ps"]
+    weight_control = work["ps"]
+    work["overlap_weight"] = np.where(work.treatment == 1, weight_treated, weight_control)
+    work["att_weight"] = np.where(work.treatment == 1, 1.0, work["ps"] / (1 - work["ps"]))
+    work["gcomp_weight"] = 1.0
+    work["_X"] = list(range(len(work)))
+    return work, model, cols, pre
+
+
+def weighted_risk(group: pd.DataFrame, column: str = "overlap_weight") -> float:
+    if group.empty:
+        return float("nan")
+    w = group[column].to_numpy(float)
+    return float(np.average(group["event_48h"].to_numpy(float), weights=w))
+
+
+def cif_risk(group: pd.DataFrame) -> float:
     if group.empty:
         return float("nan")
     x = group.sort_values("time_h")
@@ -366,46 +349,61 @@ def _cif(group: pd.DataFrame) -> float:
     e = x.event_type.to_numpy(int)
     surv, cum = 1.0, 0.0
     for ti in np.unique(t):
-        at_risk = w[t >= ti].sum()
-        if at_risk <= 0:
+        at = w[t >= ti].sum()
+        if at <= 0:
             break
         d1 = w[(t == ti) & (e == 1)].sum()
         d2 = w[(t == ti) & (e == 2)].sum()
-        cum += surv * d1 / at_risk
-        surv *= 1 - (d1 + d2) / at_risk
+        cum += surv * d1 / at
+        surv *= 1 - (d1 + d2) / at
     return float(cum)
 
 
-def _fit(df, parts):
-    work, cols, pre = _design(df, parts)
-    model = Pipeline([("pre", pre), ("lr", LogisticRegression(max_iter=4000, C=0.1))])
-    model.fit(work[cols], work.treatment)
-    ps = model.predict_proba(work[cols])[:, 1]
-    work["ps"] = ps
-    work["overlap_weight"] = np.where(work.treatment == 1, 1 - ps, ps)
-    return work, model
+def summarize(work: pd.DataFrame, column: str) -> dict:
+    r1 = weighted_risk(work[work.treatment == 1], column)
+    r0 = weighted_risk(work[work.treatment == 0], column)
+    return {"risk_treated": r1, "risk_control": r0, "rd": r1 - r0,
+            "rr": r1 / r0 if r0 > 0 else float("nan")}
 
 
-def _effect(work):
-    c1 = _cif(work[work.treatment == 1])
-    c0 = _cif(work[work.treatment == 0])
-    ess1 = work.loc[work.treatment == 1, "overlap_weight"].pow(2).sum()
-    ess0 = work.loc[work.treatment == 0, "overlap_weight"].pow(2).sum()
-    return {
-        "risk_treated": c1,
-        "risk_control": c0,
-        "rd": c1 - c0,
-        "rr": c1 / c0 if c0 > 0 else float("nan"),
-        "ess_treated": float(work.loc[work.treatment == 1, "overlap_weight"].sum() ** 2 / ess1),
-        "ess_control": float(work.loc[work.treatment == 0, "overlap_weight"].sum() ** 2 / ess0),
-        "n_treated": int((work.treatment == 1).sum()),
-        "n_control": int((work.treatment == 0).sum()),
-        "events_treated": int(work.loc[work.treatment == 1, "event_48h"].sum()),
-        "events_control": int(work.loc[work.treatment == 0, "event_48h"].sum()),
-    }
+def gcomp(df: pd.DataFrame) -> dict:
+    from sklearn.linear_model import LogisticRegression as LR
+    work, _, _ = design(df)
+    numeric = PARTS["numeric"] + ["treatment"]
+    cat = PARTS["categorical"]
+    pre = ColumnTransformer([
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), numeric),
+        ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
+                          ("oh", OneHotEncoder(handle_unknown="ignore"))]), cat),
+    ])
+    X = work[numeric + cat].copy()
+    model = Pipeline([("pre", pre), ("lr", LR(max_iter=4000, C=0.1))])
+    model.fit(X, work["event_48h"])
+    X1 = X.copy(); X1["treatment"] = 1
+    X0 = X.copy(); X0["treatment"] = 0
+    r1 = float(model.predict_proba(X1)[:, 1].mean())
+    r0 = float(model.predict_proba(X0)[:, 1].mean())
+    return {"risk_treated": r1, "risk_control": r0, "rd": r1 - r0,
+            "rr": r1 / r0 if r0 > 0 else float("nan")}
 
 
-def _bootstrap(df, parts, reps=BOOT, seed=SEED):
+def all_estimators(df: pd.DataFrame) -> pd.DataFrame:
+    work, *_ = fit_ps(df)
+    rows = []
+    crude = summarize(work.assign(overlap_weight=1.0), "overlap_weight")
+    crude["estimator"] = "Crude"
+    rows.append(crude)
+    overlap = summarize(work, "overlap_weight")
+    overlap["estimator"] = "Overlap weighted"
+    rows.append(overlap)
+    rows.append({**gcomp(df), "estimator": "g-computation"})
+    att = summarize(work, "att_weight")
+    att["estimator"] = "IPW (ATT)"
+    rows.append(att)
+    return pd.DataFrame(rows)
+
+
+def bootstrap_ci(df: pd.DataFrame, estimator: str, reps: int = BOOT, seed: int = SEED) -> dict:
     rng = np.random.default_rng(seed)
     subjects = df.subject_id.unique()
     out = []
@@ -415,74 +413,160 @@ def _bootstrap(df, parts, reps=BOOT, seed=SEED):
         if sample.treatment.nunique() < 2:
             continue
         try:
-            work, _ = _fit(sample, parts)
-            e = _effect(work)
+            if estimator == "g-computation":
+                e = gcomp(sample)
+            else:
+                work, *_ = fit_ps(sample)
+                col = {"Crude": "gcomp_weight", "Overlap weighted": "overlap_weight",
+                       "IPW (ATT)": "att_weight"}[estimator]
+                e = summarize(work, col)
         except Exception:
             continue
-        if np.isfinite(e["rr"]) and np.isfinite(e["rd"]):
+        if np.isfinite(e["rr"]):
             out.append((e["rd"], e["rr"]))
     arr = np.array(out)
-    return {
-        "rd_low": float(np.percentile(arr[:, 0], 2.5)),
-        "rd_high": float(np.percentile(arr[:, 0], 97.5)),
-        "rr_low": float(np.percentile(arr[:, 1], 2.5)),
-        "rr_high": float(np.percentile(arr[:, 1], 97.5)),
-        "reps": int(len(arr)),
-    }
+    return {"rd_low": float(np.percentile(arr[:, 0], 2.5)),
+            "rd_high": float(np.percentile(arr[:, 0], 97.5)),
+            "rr_low": float(np.percentile(arr[:, 1], 2.5)),
+            "rr_high": float(np.percentile(arr[:, 1], 97.5)),
+            "reps": int(len(arr))}
 
 
-def _balance(work):
+def balance_table(work: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for c in ["age", "vent_hours", "rass_min", "fio2_max", "peep_max", "lactate",
-              "creatinine", "log_propofol_rate", "vaso_any", "opioid_any", "sbt_any", "delirium_24h"]:
+    for c in ["age", "vent_hours", "rass_min", "fio2_max",
+              "peep_max", "lactate", "creatinine", "log_propofol_rate",
+              "vaso_any", "opioid_any", "sbt_any", "delirium_24h"]:
         x = work[c].to_numpy(float)
         ok = ~np.isnan(x)
         xx, tt = x[ok], work.treatment.to_numpy()[ok]
+
         def smd(w):
             m1 = np.average(xx[tt == 1], weights=w[tt == 1])
             m0 = np.average(xx[tt == 0], weights=w[tt == 0])
             v1 = np.average((xx[tt == 1] - m1) ** 2, weights=w[tt == 1])
             v0 = np.average((xx[tt == 0] - m0) ** 2, weights=w[tt == 0])
             return (m1 - m0) / np.sqrt((v1 + v0) / 2) if (v1 + v0) > 0 else 0.0
-        rows.append({
-            "variable": c,
-            "smd_unweighted": smd(np.ones(len(xx))),
-            "smd_weighted": smd(work.overlap_weight.to_numpy()[ok]),
-            "treated_mean": float(np.nanmean(work.loc[work.treatment == 1, c])),
-            "control_mean": float(np.nanmean(work.loc[work.treatment == 0, c])),
-        })
+
+        rows.append({"variable": c,
+                     "smd_unweighted": smd(np.ones(len(xx))),
+                     "smd_weighted": smd(work.overlap_weight.to_numpy()[ok]),
+                     "treated_mean": float(np.nanmean(work.loc[work.treatment == 1, c])),
+                     "control_mean": float(np.nanmean(work.loc[work.treatment == 0, c]))})
     return pd.DataFrame(rows)
 
 
-def _fit_and_report(analytic, parts):
-    fitted, model = _fit(analytic, parts)
-    overall = _effect(fitted)
-    overall.update(_bootstrap(analytic, parts))
-    balance = _balance(fitted)
-
-    overall["auc"] = float(_auc(fitted))
-    overall["e_value"] = _e_value(overall["rr"])
-    overall["e_value_ci"] = _e_value(overall["rr_low"])
-
-    strata = []
+def strata_table(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
     for unit in ["cardiac", "medical_surgical", "neuro"]:
-        sub = analytic[analytic.unit_class == unit]
+        sub = df[df.unit_class == unit]
         if sub.treatment.sum() < 20 or (sub.treatment == 0).sum() < 20:
             continue
-        w, _ = _fit(sub, parts)
-        e = _effect(w)
-        e.update(_bootstrap(sub, parts, reps=200, seed=SEED + 1))
-        e["stratum"] = unit
-        e["auc"] = float(_auc(w))
-        strata.append(e)
-    strata = pd.DataFrame(strata)
-
-    sens = _sensitivity(analytic, parts)
-    return {"overall": overall, "strata": strata, "sensitivity": sens,
-            "balance": balance, "work": fitted}
+        work, *_ = fit_ps(sub)
+        e = summarize(work, "overlap_weight")
+        ci = bootstrap_ci(sub, "Overlap weighted", reps=200, seed=SEED + 1)
+        rows.append({**e, **ci, "stratum": unit,
+                     "n_treated": int((sub.treatment == 1).sum()),
+                     "events_treated": int(sub.loc[sub.treatment == 1, "event_48h"].sum()),
+                     "n_control": int((sub.treatment == 0).sum()),
+                     "events_control": int(sub.loc[sub.treatment == 0, "event_48h"].sum())})
+    return pd.DataFrame(rows)
 
 
-def _auc(work):
+def sensitivity_table(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    terminal = (df.event_type == 2) & (df.time_h <= 24)
+
+    airway = df.copy()
+    airway["event_48h"] = 0
+    mask = airway.reintubation_airway_only.notna()
+    hours = (pd.to_datetime(airway.loc[mask, "reintubation_airway_only"])
+             - pd.to_datetime(airway.loc[mask, "t0"])).dt.total_seconds() / 3600.0
+    airway.loc[mask & (hours > 0) & (hours <= HORIZON), "event_48h"] = 1
+
+    variants = {
+        "primary_48h_risk": df,
+        "excluding_terminal_extubation": df[~terminal],
+        "outcome_airway_reintubation_only": airway,
+    }
+    for label, sub in variants.items():
+        work, *_ = fit_ps(sub)
+        e = summarize(work, "overlap_weight")
+        rows.append({**e, "variant": label})
+
+    work, *_ = fit_ps(df)
+    c1 = cif_risk(work[work.treatment == 1])
+    c0 = cif_risk(work[work.treatment == 0])
+    rows.append({"risk_treated": c1, "risk_control": c0, "rd": c1 - c0,
+                 "rr": c1 / c0, "variant": "competing_risk_cumulative_incidence"})
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    root = os.environ.get("MIMIC_IV_ROOT")
+    if not root:
+        sys.exit("Set MIMIC_IV_ROOT to the extracted MIMIC-IV 3.1 directory.")
+    MIMIC = Path(root).expanduser().resolve()
+    if not MIMIC.is_dir():
+        sys.exit(f"MIMIC_IV_ROOT is not a directory: {MIMIC}")
+
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=4")
+    files = build_caches(con, MIMIC)
+    df = build_cohort(con, files)
+
+    analytic = df[df.grp.isin(["transition", "propofol_only"])].copy()
+    analytic["treatment"] = (analytic.grp == "transition").astype(int)
+
+    estimators = all_estimators(analytic)
+    primary = estimators[estimators.estimator == "Overlap weighted"].iloc[0].to_dict()
+    primary.update(bootstrap_ci(analytic, "Overlap weighted"))
+    for name in ["Crude", "Overlap weighted", "g-computation", "IPW (ATT)"]:
+        row = estimators.index[estimators.estimator == name][0]
+        ci = bootstrap_ci(analytic, name)
+        for k, v in ci.items():
+            estimators.loc[row, k] = v
+
+    work, *_ = fit_ps(analytic)
+    balance = balance_table(work)
+    strata = strata_table(analytic)
+    sens = sensitivity_table(analytic)
+
+    primary["n_treated"] = int((analytic.treatment == 1).sum())
+    primary["n_control"] = int((analytic.treatment == 0).sum())
+    primary["events_treated"] = int(analytic.loc[analytic.treatment == 1, "event_48h"].sum())
+    primary["events_control"] = int(analytic.loc[analytic.treatment == 0, "event_48h"].sum())
+    primary["e_value"] = _e_value(primary["rr"])
+    primary["e_value_ci"] = _e_value(primary["rr_low"])
+    primary["auc"] = float(_auc(work))
+
+    estimators.to_csv(OUT / "table2_estimators.csv", index=False)
+    balance.to_csv(OUT / "table3_balance.csv", index=False)
+    strata.to_csv(OUT / "table4_strata.csv", index=False)
+    sens.to_csv(OUT / "table5_sensitivity.csv", index=False)
+    pd.DataFrame([primary]).to_csv(OUT / "table2_primary.csv", index=False)
+    analytic.to_csv(OUT / "analytic_cohort.csv", index=False)
+    with open(OUT / "primary_estimate.json", "w", encoding="utf-8") as fh:
+        json.dump(primary, fh, indent=2, default=float)
+
+    lines = ["# v13 primary results (common 48-hour risk scale)\n",
+             f"Extubations analysed: {primary['n_treated'] + primary['n_control']:,} "
+             f"({primary['n_treated']:,} transition, {primary['n_control']:,} continued propofol)\n",
+             f"Primary (overlap weighted): {100*primary['risk_treated']:.1f}% vs "
+             f"{100*primary['risk_control']:.1f}%; RD {100*primary['rd']:+.2f} pp "
+             f"({100*primary['rd_low']:+.2f} to {100*primary['rd_high']:+.2f}); "
+             f"RR {primary['rr']:.2f} ({primary['rr_low']:.2f} to {primary['rr_high']:.2f})\n",
+             f"E-value {primary['e_value']:.2f} (CI bound {primary['e_value_ci']:.2f}); "
+             f"propensity-score AUC {primary['auc']:.3f}\n",
+             "\n## Estimators on the common scale\n", estimators.to_string(index=False),
+             "\n## Strata\n", strata.to_string(index=False),
+             "\n## Sensitivity\n", sens.to_string(index=False),
+             "\n## Balance\n", balance.to_string(index=False)]
+    (OUT / "results_report.md").write_text("\n".join(str(x) for x in lines), encoding="utf-8")
+    print("Done. Outputs in", OUT)
+
+
+def _auc(work: pd.DataFrame) -> float:
     from sklearn.metrics import roc_auc_score
     return roc_auc_score(work.treatment, work.ps)
 
@@ -493,69 +577,6 @@ def _e_value(rr: float) -> float:
     if rr < 1:
         rr = 1 / rr
     return float(rr + np.sqrt(rr * (rr - 1)))
-
-
-def _sensitivity(analytic, parts):
-    rows = []
-    terminal = (analytic.event_type == 2) & (analytic.time_h <= 24)
-
-    airway = analytic.copy()
-    airway["event_type"] = 0
-    airway["time_h"] = HORIZON
-    mask = airway.reintubation_airway_only.notna()
-    airway.loc[mask, "time_h"] = np.minimum(
-        HORIZON,
-        (pd.to_datetime(airway.loc[mask, "reintubation_airway_only"])
-         - pd.to_datetime(airway.loc[mask, "t0"])).dt.total_seconds() / 3600.0,
-    )
-    airway.loc[mask & (airway.time_h <= HORIZON), "event_type"] = 1
-    airway["event_48h"] = (airway.event_type == 1).astype(int)
-
-    variants = {
-        "primary": analytic,
-        "excluding_terminal_extubation": analytic[~terminal],
-        "outcome_airway_reintubation_only": airway,
-    }
-    for label, sub in variants.items():
-        w, _ = _fit(sub, parts)
-        e = _effect(w)
-        e["variant"] = label
-        rows.append(e)
-    return pd.DataFrame(rows)
-
-
-def _write_tables(df, analytic, res):
-    res["balance"].to_csv(OUT / "table3_balance.csv", index=False)
-    res["strata"].to_csv(OUT / "table4_strata.csv", index=False)
-    res["sensitivity"].to_csv(OUT / "table5_sensitivity.csv", index=False)
-    pd.DataFrame([res["overall"]]).to_csv(OUT / "table2_primary.csv", index=False)
-    analytic.to_csv(OUT / "analytic_cohort.csv", index=False)
-    with open(OUT / "primary_estimate.json", "w", encoding="utf-8") as fh:
-        json.dump(res["overall"], fh, indent=2, default=float)
-
-
-def _write_report(df, analytic, res):
-    o = res["overall"]
-    lines = [
-        "# v13 primary results\n",
-        f"Extubation events: {len(df):,}; analysable contrast: {o['n_treated'] + o['n_control']:,} "
-        f"({o['n_treated']:,} transition, {o['n_control']:,} continued propofol)\n",
-        f"48 h reintubation, weighted cumulative incidence: {100*o['risk_treated']:.1f}% vs "
-        f"{100*o['risk_control']:.1f}%\n",
-        f"Risk difference {100*o['rd']:+.2f} pp (95% CI {100*o['rd_low']:+.2f} to {100*o['rd_high']:+.2f})\n",
-        f"Risk ratio {o['rr']:.2f} (95% CI {o['rr_low']:.2f} to {o['rr_high']:.2f})\n",
-        f"Effective sample size {o['ess_treated']:.0f} treated / {o['ess_control']:.0f} control; "
-        f"propensity-score AUC {o['auc']:.3f}\n",
-        f"E-value for the risk ratio {o['e_value']:.2f}; for the CI bound {o['e_value_ci']:.2f}\n",
-        f"Bootstrap replicates: {o['reps']}\n",
-        "\n## Strata\n",
-        res["strata"].to_string(index=False),
-        "\n## Sensitivity\n",
-        res["sensitivity"].to_string(index=False),
-        "\n## Balance\n",
-        res["balance"].to_string(index=False),
-    ]
-    (OUT / "results_report.md").write_text("\n".join(str(x) for x in lines), encoding="utf-8")
 
 
 if __name__ == "__main__":
