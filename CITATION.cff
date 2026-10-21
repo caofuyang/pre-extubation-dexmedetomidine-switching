@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying manuscript."
+title: "Pre-extubation switching from propofol to dexmedetomidine and extubation failure: analysis code"
+version: 1.0.0
+date-released: 2026-10-21
+license: MIT
+authors:
+  - family-names: Cao
+    given-names: Fuyang
+    orcid: "https://orcid.org/0000-0002-3746-8489"
+  - family-names: Li
+    given-names: Juan
+  - family-names: Wu
+    given-names: Xinshun
+  - family-names: Zeng
+    given-names: Ruxiao
+  - family-names: Liu
+    given-names: Xiaomei
